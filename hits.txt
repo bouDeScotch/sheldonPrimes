@@ -1,0 +1,9 @@
+a=1 n=2 b=1 rev(n)=2 trivial=1
+a=2 n=3 b=2 rev(n)=3 trivial=1
+a=3 n=5 b=3 rev(n)=5 trivial=1
+a=4 n=7 b=4 rev(n)=7 trivial=1
+a=5 n=11 b=5 rev(n)=11 trivial=1
+a=12 n=37 b=21 rev(n)=73 trivial=0
+a=21 n=73 b=12 rev(n)=37 trivial=0
+a=8114118 n=143787341 b=8114118 rev(n)=143787341 trivial=1
+a=535252535 n=11853735811 b=535252535 rev(n)=11853735811 trivial=1
