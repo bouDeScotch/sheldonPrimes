@@ -48,5 +48,10 @@ gcc -Wall -Wextra -O3 prime_reverse.c -o output/prime_reverse.exe -lprimesieve
 ./output/prime_reverse.exe
 ```
 
+## The next step
+I am still trying to find the next number of this sequence. Using this program, it would take around 1Zhrs of computation to increase the lower bound to $10^12$ or to find a(10), so this will be ran soon.
+But there is also a lot to gain from parrallelization, as the two big loops are essentially doing simple computation and are both CPU-bounded. As I have 20 cores, this could be a huge speedup. 
+
+
 ## 🤖 AI Acknowledgment
 The optimization pipeline, analytical bounds derivation, and C implementation were developed collaboratively with AI. Every filter, math bound, and algorithm stage was thoroughly tested, verified, and benchmarked against all known OEIS terms ( $a(1)$ through $a(9)$ ).
