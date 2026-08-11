@@ -21,11 +21,30 @@ Earlier brute-force approaches generated massive **35 GB disk sieves** and were 
 3. **Deterministic Miller-Rabin Pre-Filter:** Reduces candidates down to a microscopic pool using 4 proven bases for numbers under $3.4 \times 10^{14}$.
 4. **Zero-Disk In-Memory Verification:** The candidate pool is so small (~273,000 items out of $10^{11}$ primes) that it consumes **< 9 MB of RAM**, allowing a fast, single-pass verification loop without any file I/O.
 
-### Performance Milestone
+### Performance Milestone (single-threaded)
 - **100 Billion Primes Processed** in **~61 minutes** on a single thread (~27.2 million primes/sec).
 - **RAM Usage:** ~9 MB total (no disk writing required).
 
----
+## ⚡ Multi-threading (v5)
+
+The candidate-generation loop is now parallelized with OpenMP. `primesieve_iterator` can only generate primes in sequential order on a single thread, so the value range $[3, \text{LARGEST\ PRIME\ POSSIBLE}]$ is split into one chunk per thread, and each thread gets its **own** iterator.
+
+The one piece of state a sequential loop gets "for free" that a chunked loop doesn't is `a`, the *rank* of the current prime (1st, 2nd, 3rd prime, ...), which the digit-reversal logic depends on. Each thread recovers its starting rank with `primecount_pi(chunk_start - 1) + 1` — `primecount`'s prime counting function is itself multi-threaded and asymptotically much faster than counting sequentially.
+
+Each thread accumulates candidates in its own growable buffer (no locking), and all buffers are concatenated after the parallel region — safe to do in any order since the result gets sorted by `reverse_a` immediately afterward anyway.
+
+```bash
+OMP_NUM_THREADS=20 ./output/prime_reverse.exe   # defaults to all available cores if unset
+```
+
+### Empirical scaling law
+
+Benchmarking the parallelized loop (20 threads) for $k = 6 \ldots 10$ ($A_{MAX} = 10^k$) and fitting a single-parameter model $t_1 = c \cdot N \cdot \ln(\ln(N))$ gives $R^2 = 0.99999$ (fit dominated by, and most accurate at, the largest tested points — $k=9$ and $k=10$ are within ~3% and ~0.03% of the model respectively). Extrapolating:
+
+| $k$ | $A_{MAX}$ | Estimated time (20 threads) |
+|---|---|---|
+| 11 | $10^{11}$ | ~8 min |
+| 12 | $10^{12}$ | ~81 min (~1.5h) |
 
 ## 🛠️ Dependencies
 
@@ -35,23 +54,26 @@ On **MSYS2 (UCRT64)** or **Arch Linux**:
 ```bash
 pacman -S mingw-w64-ucrt-x86_64-primesieve mingw-w64-ucrt-x86_64-primecount
 ```
-On **Ubuntu/Debian** (not tested)
+On **Ubuntu/Debian**:
 ```bash
 sudo apt update
 sudo apt install libprimesieve-dev libprimecount-dev
 ```
+
 ## 💻 Building and Running
 
-Compile with maximum gcc optimizations (-O3):
+Compile with maximum gcc optimizations (-O3) and OpenMP enabled:
 ```bash
-gcc -Wall -Wextra -O3 prime_reverse.c -o output/prime_reverse.exe -lprimesieve
+gcc -Wall -Wextra -O3 -fopenmp prime_reverse.c -o output/prime_reverse.exe -lprimesieve -lprimecount -lm
 ./output/prime_reverse.exe
 ```
 
 ## The next step
-I am still trying to find the next number of this sequence. Using this program, it would take around 1Zhrs of computation to increase the lower bound to $10^12$ or to find a(10), so this will be ran soon.
-But there is also a lot to gain from parrallelization, as the two big loops are essentially doing simple computation and are both CPU-bounded. As I have 20 cores, this could be a huge speedup. 
 
+I am still trying to find the next number of this sequence. Using the parallelized version on my 20-core machine, increasing the lower bound to $10^{12}$ (or finding $a(10)$) is estimated to take around **~1.5 hours** of computation, so this will be run soon.
+
+There is also more to gain from parallelization: the two big loops in the program are essentially doing simple computation and are both CPU-bound. So far only the candidate-generation loop has been parallelized — the second loop (computing $\pi(\text{reverse}(a))$ for each candidate) is still sequential and is a good target next.
 
 ## 🤖 AI Acknowledgment
-The optimization pipeline, analytical bounds derivation, and C implementation were developed collaboratively with AI. Every filter, math bound, and algorithm stage was thoroughly tested, verified, and benchmarked against all known OEIS terms ( $a(1)$ through $a(9)$ ).
+
+The optimization pipeline, analytical bounds derivation, C implementation, OpenMP parallelization, and performance-scaling analysis were developed collaboratively with AI. Every filter, math bound, and algorithm stage was thoroughly tested, verified, and benchmarked against all known OEIS terms ($a(1)$ through $a(9)$).
