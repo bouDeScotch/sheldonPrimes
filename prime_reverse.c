@@ -1,432 +1,292 @@
-/*
- * prime_reverse_v2.c
- *
- * Find all a in [1, A_MAX] such that:
- *     n  = p(a)              (n is the a-th prime)
- *     b  = reverse_10(a)     (b is a written backwards in base 10)
- *     reverse_10(n) = p(b)   (reverse of n is the b-th prime)
- *
- * ---------------------------------------------------------------------
- * WHY THIS VERSION IS DIFFERENT FROM prime_reverse.c
- * ---------------------------------------------------------------------
- * v1 stored every prime as a raw 8-byte uint64_t in RAM. That's fine for
- * A_MAX=1e9 (8 GB) but breaks down for A_MAX=1e10 (80 GB, way past 32GB).
- *
- * v1 ALSO had a correctness gap: the sieve only extended slightly past
- * p(A_MAX), but reverse(n) for an n with D digits can be as large as
- * 10^D - 1, which can be ~4-10x bigger than p(A_MAX) itself. So some
- * legitimate hits near the end of a v1 run could have been silently
- * missed (reverse(n) simply wasn't in the sieved range, so it looked
- * "not found" instead of "found, but not the right index").
- *
- * v2 fixes both:
- *   1. Sieves all the way out to 10^D - 1, where D = digit count of the
- *      (margin-padded) estimate of p(A_MAX). This guarantees reverse(n)
- *      is always in range, whatever it turns out to be.
- *   2. Stores primes as GAP-ENCODED bytes on DISK instead of raw values
- *      in RAM: gap/2 fits in one byte for the overwhelming majority of
- *      primes in this range (average gap near 10^12 is ~28, and known
- *      maximal gaps below 10^12 are only in the low hundreds), with an
- *      escape byte (0x00 + 8-byte literal gap) for the rare larger ones.
- *      This is ~1 byte/prime on disk instead of 8 bytes/prime in RAM.
- *   3. Keeps small "checkpoints" (value + file offset) every 8192 primes
- *      fully in RAM (tens of MB, trivial) so any lookup can binary-search
- *      the checkpoints then decode forward a short distance on disk.
- *   4. Adds symmetry pruning: if (a,b) is a hit and a doesn't end in 0,
- *      then (b,a) is automatically also a hit - skip processing a when
- *      a > reverse(a), and record both directions when a hit is found.
- *   5. Parallelizes the search loop with OpenMP (each thread opens its
- *      own read handle onto the gap file).
- *
- * ---------------------------------------------------------------------
- * DISK / RAM REQUIREMENTS (approximate, printed exactly at runtime)
- * ---------------------------------------------------------------------
- *   A_MAX = 2e9   -> sieve to ~1e11, ~4.1e9 primes  -> ~4-5 GB disk
- *   A_MAX = 4e9   -> sieve to ~1e11, ~4.1e9 primes  -> ~4-5 GB disk
- *   A_MAX = 1e10  -> sieve to ~1e12, ~3.8e10 primes -> ~35-40 GB disk
- *   RAM usage stays small throughout (checkpoints + small buffers only,
- *   well under 1 GB even at A_MAX=1e10) - the big data lives on disk.
- *
- * Compile (MinGW/MSYS2 or Linux):
- *   gcc -O3 -march=native -fopenmp -o prime_reverse_v2 prime_reverse_v2.c -lm
- * Run (optional arg = A_MAX, default 10 billion):
- *   ./prime_reverse_v2 10000000000
- *
- * Needs ~40 GB free disk space next to the executable for A_MAX=1e10
- * (creates gaps.bin). Runtime for the sieve phase at that scale will be
- * substantially longer than the v1 run (order of an hour or more,
- * depending on CPU) since it sieves ~40x further out. The search phase
- * itself should be fast and scales with your core count via OpenMP.
- */
-
+#include "primesieve.h"
+#include "primecount.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <string.h>
+#include <stdbool.h>
 #include <math.h>
 #include <time.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+/*
+This is a new version of the prime_reverse_v3.c file. We will now use a completly new approach to try to find a(10)
+We will iterate through all primes like before, filtering those who can't be solutions based on basic filters like in the previous version.
+Every index that passes the filters will be a candidate.
+We will then sort the candidates by their reverse value and compute their reverse prime value.
+Because we will already have computed a, pi(a) and reverse(a), computing pi(reverse(a)) will be easy and fast considering there will be
+only "a few" candidates, and that because it is sorted we won't have to do a random access, in fact there probably won't even be
+a need for a file because computing on the fly might be fast enough, or even could be done on the GPU if we want to go that far.
 
-#ifdef _WIN32
-  #define FSEEK _fseeki64
-  #define FTELL _ftelli64
-#else
-  #define _FILE_OFFSET_BITS 64
-  #define FSEEK fseeko
-  #define FTELL ftello
-#endif
+NOTE : After some testing, the number of candidates stays around the thousands, maybe millions at worst, but it fits in RAM easily.
 
-/* ---------------- configuration ---------------- */
-static uint64_t A_MAX = 10000000000ULL;
-static const uint64_t CHECKPOINT_INTERVAL = 8192;
-static const char *GAP_FILE_PATH = "gaps.bin";
+I will reuse a lot of code from the previous version because I want the file to be independent.
+*/
 
-#define SEG_SIZE   (1ULL << 27)   /* ~134M numbers per sieve segment */
-#define WBUF_SIZE  (1 << 20)      /* 1MB write buffer */
-#define RBUF_SIZE  (1 << 16)      /* 64KB read buffer per lookup */
-
-static uint64_t total_primes_available = 0;
-
-/* ---------------- utility ---------------- */
-
-static inline uint64_t reverse_u64(uint64_t x) {
-    uint64_t r = 0;
-    while (x > 0) { r = r * 10 + x % 10; x /= 10; }
-    return r;
+// Fast modular multiplication using 128-bit integers
+inline uint64_t mul_mod(uint64_t a, uint64_t b, uint64_t m) {
+    return (uint64_t)(((__uint128_t)a * b) % m);
 }
-static inline int digits_u64(uint64_t x) {
-    int d = 1; while (x >= 10) { x /= 10; d++; } return d;
+
+// Fast modular exponentiation
+uint64_t power_mod(uint64_t base, uint64_t exp, uint64_t mod) {
+    uint64_t res = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp % 2 == 1) res = mul_mod(res, base, mod);
+        base = mul_mod(base, base, mod);
+        exp /= 2;
+    }
+    return res;
 }
-static uint64_t pow10_u64(int d) {
-    uint64_t r = 1; for (int i = 0; i < d; i++) r *= 10; return r;
+
+// Deterministic Miller-Rabin up to 3.3 x 10^24 (using 7 bases)
+bool is_prime_mr(uint64_t n) {
+    if (n < 2) return false;
+    if (n == 2 || n == 3 || n == 5) return true;
+    if (n % 2 == 0 || n % 3 == 0 || n % 5 == 0) return false;
+
+    uint64_t d = n - 1;
+    int s = 0;
+    while (d % 2 == 0) {
+        d /= 2;
+        s++;
+    }
+
+    static const uint64_t bases[] = {2, 3, 5, 7, 11, 13, 17};
+    for (int i = 0; i < 7; i++) {
+        uint64_t a = bases[i];
+        if (n <= a) break;
+        
+        uint64_t x = power_mod(a, d, n);
+        if (x == 1 || x == n - 1) continue;
+        
+        bool composite = true;
+        for (int r = 1; r < s; r++) {
+            x = mul_mod(x, x, n);
+            if (x == n - 1) {
+                composite = false;
+                break;
+            }
+        }
+        if (composite) return false;
+    }
+    return true;
 }
-static uint64_t nth_prime_upper_bound(uint64_t n) {
-    if (n < 6) return 15;
+
+bool is_in_prime_bounds(uint64_t n, uint64_t candidate_prime) {
+    if (n < 6) return true; // Bounds math is slightly off for tiny primes, allow them
+
     double dn = (double)n;
-    double bound = dn * (log(dn) + log(log(dn)));
-    bound *= 1.06;
-    return (uint64_t)bound + 1000;
-}
-static int is_palindrome_u64(uint64_t x) { return x == reverse_u64(x); }
+    double ln_n = log(dn);
+    double ln_ln_n = log(ln_n);
 
-/* ---------------- checkpoints (RAM, small) ---------------- */
-typedef struct { uint64_t count; uint64_t value; int64_t offset; } Checkpoint;
-static Checkpoint *checkpoints = NULL;
-static uint64_t checkpoints_count = 0, checkpoints_cap = 0;
+    // Dusart 2010 Lower Bound (valid for n >= 3)
+    double lower_factor = ln_n + ln_ln_n - 1.0 + (ln_ln_n - 2.1) / ln_n;
+    double upper_factor;
 
-static void checkpoint_push(uint64_t count, uint64_t value, int64_t offset) {
-    if (checkpoints_count == checkpoints_cap) {
-        checkpoints_cap = checkpoints_cap ? checkpoints_cap * 2 : 1024;
-        checkpoints = realloc(checkpoints, checkpoints_cap * sizeof(Checkpoint));
-        if (!checkpoints) { fprintf(stderr, "OOM checkpoints\n"); exit(1); }
-    }
-    checkpoints[checkpoints_count].count = count;
-    checkpoints[checkpoints_count].value = value;
-    checkpoints[checkpoints_count].offset = offset;
-    checkpoints_count++;
-}
-static uint64_t checkpoint_find_by_count(uint64_t target_count) {
-    uint64_t lo = 0, hi = checkpoints_count - 1;
-    while (lo < hi) {
-        uint64_t mid = lo + (hi - lo + 1) / 2;
-        if (checkpoints[mid].count <= target_count) lo = mid; else hi = mid - 1;
-    }
-    return lo;
-}
-static uint64_t checkpoint_find_by_value(uint64_t target_value) {
-    uint64_t lo = 0, hi = checkpoints_count - 1;
-    while (lo < hi) {
-        uint64_t mid = lo + (hi - lo + 1) / 2;
-        if (checkpoints[mid].value <= target_value) lo = mid; else hi = mid - 1;
-    }
-    return lo;
-}
-
-/* ---------------- gap record encode/decode ---------------- */
-
-typedef struct { FILE *f; uint8_t buf[RBUF_SIZE]; int len, pos; } Reader;
-
-static void reader_init(Reader *r, FILE *f, int64_t offset) {
-    r->f = f; FSEEK(f, offset, SEEK_SET); r->len = 0; r->pos = 0;
-}
-static int reader_next_byte(Reader *r) {
-    if (r->pos >= r->len) {
-        r->len = (int)fread(r->buf, 1, RBUF_SIZE, r->f);
-        r->pos = 0;
-        if (r->len <= 0) return -1;
-    }
-    return r->buf[r->pos++];
-}
-static int64_t reader_next_gap(Reader *r) {
-    int b = reader_next_byte(r);
-    if (b < 0) return -1;
-    if (b == 0) {
-        uint64_t g = 0;
-        for (int i = 0; i < 8; i++) {
-            int c = reader_next_byte(r);
-            if (c < 0) return -1;
-            g |= ((uint64_t)c) << (8 * i);
-        }
-        return (int64_t)g;
-    }
-    return (int64_t)b * 2;
-}
-
-/* ---------------- writer (single-threaded, sieve phase) ---------------- */
-static FILE *gap_write_f = NULL;
-static uint8_t wbuf[WBUF_SIZE];
-static int wbuf_pos = 0;
-static int64_t total_bytes_written = 0;
-
-static void writer_flush(void) {
-    if (wbuf_pos > 0) {
-        fwrite(wbuf, 1, wbuf_pos, gap_write_f);
-        total_bytes_written += wbuf_pos;
-        wbuf_pos = 0;
-    }
-}
-static void writer_put_byte(uint8_t b) {
-    if (wbuf_pos == WBUF_SIZE) writer_flush();
-    wbuf[wbuf_pos++] = b;
-}
-static void writer_put_gap(uint64_t gap) {
-    uint64_t half = gap / 2;
-    if (half >= 1 && half <= 255) {
-        writer_put_byte((uint8_t)half);
+    // Dusart 2010 Upper Bound (valid for n >= 688383)
+    if (n >= 688383) {
+        upper_factor = ln_n + ln_ln_n - 1.0 + (ln_ln_n - 2.0) / ln_n;
     } else {
-        writer_put_byte(0);
-        for (int i = 0; i < 8; i++) writer_put_byte((uint8_t)((gap >> (8 * i)) & 0xFF));
+        // Safe fallback upper bound for smaller 'n'
+        upper_factor = ln_n + ln_ln_n; 
     }
-}
-static inline int64_t current_logical_offset(void) {
-    return total_bytes_written + wbuf_pos;
+
+    // Apply a 0.001 margin to protect against IEEE 754 float inaccuracies
+    uint64_t min_possible = (uint64_t)(dn * (lower_factor - 0.001));
+    uint64_t max_possible = (uint64_t)(dn * (upper_factor + 0.001)) + 1;
+
+    return (candidate_prime >= min_possible && candidate_prime <= max_possible);
 }
 
-/* ---------------- lookups (thread-safe: caller supplies its own FILE*) ---------------- */
-
-static uint64_t get_nth_prime(FILE *f, uint64_t a) {
-    if (a == 1) return 2;
-    uint64_t ci = checkpoint_find_by_count(a);
-    Reader r; reader_init(&r, f, checkpoints[ci].offset);
-    uint64_t value = checkpoints[ci].value;
-    uint64_t steps = a - checkpoints[ci].count;
-    for (uint64_t s = 0; s < steps; s++) {
-        int64_t g = reader_next_gap(&r);
-        if (g < 0) { fprintf(stderr, "unexpected EOF in get_nth_prime(%llu)\n", (unsigned long long)a); exit(1); }
-        value += (uint64_t)g;
+uint64_t reverse(uint64_t n) {
+    uint64_t reversed = 0;
+    while (n > 0) {
+        reversed = reversed * 10 + n % 10;
+        n /= 10;
     }
-    return value;
+    return reversed;
 }
 
-/* returns 1-based prime index of target, or 0 if target is not prime / not in range */
-static uint64_t find_prime_index(FILE *f, uint64_t target) {
-    if (target == 2) return 1;
-    if (target < 2) return 0;
-    uint64_t ci = checkpoint_find_by_value(target);
-    Reader r; reader_init(&r, f, checkpoints[ci].offset);
-    uint64_t value = checkpoints[ci].value;
-    uint64_t count = checkpoints[ci].count;
-    if (value == target) return count;
-    while (value < target) {
-        int64_t g = reader_next_gap(&r);
-        if (g < 0) return 0;
-        value += (uint64_t)g;
-        count++;
-        if (value == target) return count;
-        if (value > target) return 0;
-    }
-    return 0;
+double time_taken_between(struct timespec start, struct timespec end) {
+    double time_taken = (end.tv_sec - start.tv_sec) * 1e9;
+    time_taken = (time_taken + (end.tv_nsec - start.tv_nsec)) * 1e-9;
+    return time_taken;
 }
 
-/* ---------------- segmented sieve + gap generation ---------------- */
+typedef struct {
+    uint64_t a;
+    uint64_t prime_a;
+    uint64_t reverse_a;
+    uint64_t reverse_prime_a;
+} Candidate;
 
-static void generate_primes(uint64_t sieve_limit) {
-    uint64_t sqrt_limit = (uint64_t)sqrt((double)sieve_limit) + 1;
+void merge_sort(Candidate* arr, size_t left, size_t right) {
+    if (right <= left) return;
+    size_t mid = left + (right - left) / 2;
+    merge_sort(arr, left, mid);
+    merge_sort(arr, mid + 1, right);
+    size_t n1 = mid - left + 1;
+    size_t n2 = right - mid;
 
-    uint8_t *small_composite = calloc(sqrt_limit + 1, 1);
-    uint64_t *small_primes = malloc(sizeof(uint64_t) * (sqrt_limit / 8 + 100));
-    uint64_t small_count = 0;
-    for (uint64_t i = 2; i <= sqrt_limit; i++) {
-        if (!small_composite[i]) {
-            small_primes[small_count++] = i;
-            for (uint64_t j = i * i; j <= sqrt_limit; j += i) small_composite[j] = 1;
+    Candidate* L = malloc(n1 * sizeof(Candidate));
+    Candidate* R = malloc(n2 * sizeof(Candidate));
+
+    for (size_t i = 0; i < n1; i++) L[i] = arr[left + i];
+    for (size_t j = 0; j < n2; j++) R[j] = arr[mid + 1 + j];
+    arr[left + n1 + n2 - 1] = arr[right]; // Ensure the last element is copied
+
+    // Merge the temporary arrays back into arr[left..right]
+    size_t i = 0, j = 0, k = left;
+    while (i < n1 && j < n2) {
+        if (L[i].reverse_a <= R[j].reverse_a) {
+            arr[k++] = L[i++];
+        } else {
+            arr[k++] = R[j++];
         }
     }
-    free(small_composite);
-
-    gap_write_f = fopen(GAP_FILE_PATH, "wb");
-    if (!gap_write_f) { perror("fopen gaps.bin"); exit(1); }
-
-    uint64_t primes_count = 2;
-    uint64_t prev_value = 3;
-    checkpoint_push(2, 3, 0);
-    uint64_t next_checkpoint_at = 2 + CHECKPOINT_INTERVAL;
-
-    time_t t0 = time(NULL);
-
-    for (uint64_t low = 4; low <= sieve_limit; low += SEG_SIZE) {
-        uint64_t high = low + SEG_SIZE - 1;
-        if (high > sieve_limit) high = sieve_limit;
-        uint64_t span = high - low + 1;
-        uint64_t nbits = span / 2 + 2;
-        uint8_t *seg = calloc(nbits / 8 + 1, 1);
-
-        for (uint64_t k = 0; k < small_count; k++) {
-            uint64_t p = small_primes[k];
-            if (p < 3) continue;
-            if (p * p > high) break;
-            uint64_t start = (low % p == 0) ? low : (low + (p - low % p));
-            if (start < p * p) start = p * p;
-            if ((start & 1) == 0) start += p;
-            for (uint64_t m = start; m <= high; m += 2 * p) {
-                uint64_t idx = (m - low) / 2;
-                seg[idx >> 3] |= (uint8_t)(1u << (idx & 7));
-            }
-        }
-
-        uint64_t first_odd = (low % 2 == 0) ? low + 1 : low;
-        for (uint64_t v = first_odd; v <= high; v += 2) {
-            uint64_t idx = (v - low) / 2;
-            if (seg[idx >> 3] & (1u << (idx & 7))) continue;
-            uint64_t gap = v - prev_value;
-            writer_put_gap(gap);
-            prev_value = v;
-            primes_count++;
-            if (primes_count == next_checkpoint_at) {
-                checkpoint_push(primes_count, v, current_logical_offset());
-                next_checkpoint_at += CHECKPOINT_INTERVAL;
-            }
-        }
-        free(seg);
-
-        fprintf(stderr, "[sieve] %.1f%% (up to %llu / %llu), primes so far=%llu, elapsed=%lds\n",
-                100.0 * high / sieve_limit, (unsigned long long)high,
-                (unsigned long long)sieve_limit, (unsigned long long)primes_count,
-                (long)(time(NULL) - t0));
-    }
-
-    writer_flush();
-    fclose(gap_write_f);
-    free(small_primes);
-
-    fprintf(stderr, "[sieve] done. total primes=%llu, gap file bytes=%lld, elapsed=%lds\n",
-            (unsigned long long)primes_count, (long long)total_bytes_written,
-            (long)(time(NULL) - t0));
-
-    if (primes_count < A_MAX) {
-        fprintf(stderr, "WARNING: only found %llu primes, wanted %llu -- increase margin.\n",
-                (unsigned long long)primes_count, (unsigned long long)A_MAX);
-    }
-    total_primes_available = primes_count;
+    while (i < n1) arr[k++] = L[i++];
+    while (j < n2) arr[k++] = R[j++];
+    free(L);
+    free(R);
 }
 
-/* ---------------- main search phase ---------------- */
 
-static void search(void) {
-    uint64_t limit_a = A_MAX;
-    if (limit_a > total_primes_available) limit_a = total_primes_available;
+int main() {
+    const int k = 12; // A_MAX is 10^k
+    const uint64_t A_MAX = (uint64_t)pow(10, k);
 
-    FILE *out = fopen("hits.txt", "w");
-    if (!out) { perror("fopen hits.txt"); exit(1); }
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    // This is still needed to make sure the primesieve functions are optimized for our use case
+    uint64_t LARGEST_PRIME_POSSIBLE;
+    if (A_MAX == 100000000000) {
+        // We already computed it, it is :
+        LARGEST_PRIME_POSSIBLE = 2760727302517;
+        // I am hard coding it because it takes 2minutes to compute it and I don't want to wait that long every time I run the program
+    } else {
+        LARGEST_PRIME_POSSIBLE = primesieve_nth_prime(A_MAX, 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
 
-    uint64_t hits = 0, nontrivial_hits = 0;
-    uint64_t processed = 0;
-    time_t t0 = time(NULL);
+    double time_taken = time_taken_between(start, end);
+    printf("Largest prime possible is %llu\n", LARGEST_PRIME_POSSIBLE);
+    printf("Time taken: %.9f seconds\n", time_taken);
 
-    #pragma omp parallel
-    {
-        FILE *f = fopen(GAP_FILE_PATH, "rb");
-        if (!f) { perror("fopen gaps.bin (reader)"); exit(1); }
-        uint64_t local_processed = 0;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    primesieve_iterator it;
 
-        #pragma omp for schedule(dynamic, 100000)
-        for (uint64_t a = 1; a <= limit_a; a++) {
-            uint64_t b = reverse_u64(a);
+    primesieve_init(&it);
+    primesieve_jump_to(&it, 3, LARGEST_PRIME_POSSIBLE);
+    clock_gettime(CLOCK_MONOTONIC, &end);
 
-            if (a % 10 != 0 && a > b) continue; /* mirror already handled */
-            if (b == 0 || b > limit_a) continue;
+    time_taken = time_taken_between(start, end);
+    printf("Time taken to initialize iterator: %.9f seconds\n", time_taken);
 
-            uint64_t n = get_nth_prime(f, a);
-            uint64_t rn = reverse_u64(n);
-            uint64_t idx = find_prime_index(f, rn);
+    // Problem with this approach is that we do not know how many candidates we will have, we will first write them to a file and either
+    // read them back to memory or sort them in the file, depending on how many candidates we have.
 
-            if (idx == b) {
-                int trivial = is_palindrome_u64(a);
-                #pragma omp critical
-                {
-                    fprintf(out, "a=%llu n=%llu b=%llu rev(n)=%llu trivial=%d\n",
-                            (unsigned long long)a, (unsigned long long)n,
-                            (unsigned long long)b, (unsigned long long)rn, trivial);
-                    fflush(out);
-                    hits++;
-                    if (!trivial) {
-                        nontrivial_hits++;
-                        fprintf(stderr, ">>> NONTRIVIAL HIT: a=%llu n=%llu b=%llu rev(n)=%llu\n",
-                                (unsigned long long)a, (unsigned long long)n,
-                                (unsigned long long)b, (unsigned long long)rn);
-                    }
-                    /* mirror: (b, a) is automatically also a hit, since a % 10 != 0
-                       guarantees reverse(b) == a exactly. Record it directly without
-                       another lookup - we already have all four values. */
-                    if (a != b && a % 10 != 0) {
-                        fprintf(out, "a=%llu n=%llu b=%llu rev(n)=%llu trivial=%d\n",
-                                (unsigned long long)b, (unsigned long long)rn,
-                                (unsigned long long)a, (unsigned long long)n, trivial);
-                        hits++;
-                        if (!trivial) nontrivial_hits++;
-                    }
-                }
-            }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    uint64_t prime_a;
+    uint64_t a = 2;
+    size_t num_candidates = 0; // For now we'll count them
+    size_t had_to_compute_bounds = 0; // For now we'll count them
+    size_t had_to_compute_primality = 0; // For now we'll count them
 
-            local_processed++;
-            if (local_processed % 2000000 == 0) {
-                #pragma omp atomic
-                processed += 2000000;
-                #pragma omp critical
-                fprintf(stderr, "[progress] ~%llu / %llu (%.1f%%) hits=%llu nontrivial=%llu elapsed=%lds\n",
-                        (unsigned long long)processed, (unsigned long long)limit_a,
-                        100.0 * processed / limit_a, (unsigned long long)hits,
-                        (unsigned long long)nontrivial_hits, (long)(time(NULL) - t0));
-            }
+
+    Candidate *candidates = malloc(sizeof(Candidate) * 1000000);
+    if (candidates == NULL) {
+        fprintf(stderr, "Error allocating memory for candidates\n");
+        return 1;
+    }
+    while ((prime_a = primesieve_next_prime(&it)) <= LARGEST_PRIME_POSSIBLE) {
+        // Run the basic filters
+        if (a % 10 == 0) { 
+            // If a ends with 0, then reverse(a) will start with 0 so will be an order of magnitude smaller 
+            // Because primes grow sequentially, this means that reverse(a) will be smaller than prime(a) and thus cannot be a solution
+            a++;
+            continue;
         }
-        fclose(f);
+
+        uint64_t reverse_of_prime_a = reverse(prime_a);
+
+        if (reverse_of_prime_a % 2 == 0 || reverse_of_prime_a % 3 == 0 || reverse_of_prime_a % 5 == 0) {
+            a++;
+            continue;
+        }
+
+        uint64_t reverse_a = reverse(a);
+
+        had_to_compute_bounds++;
+        if (!is_in_prime_bounds(reverse_a, reverse_of_prime_a)) {
+            a++;
+            continue;
+        }
+
+
+        had_to_compute_primality++;
+
+        if (!is_prime_mr(reverse_of_prime_a)) {
+            a++;
+            continue;
+        }
+
+        // If we reach here, we have a candidate
+        num_candidates++;
+        Candidate candidate = {a, prime_a, reverse_a, reverse_of_prime_a};
+        candidates[num_candidates - 1] = candidate;
+        //printf("Found candidate: a = %llu, prime(a) = %llu, reverse(a) = %llu, reverse(prime(a)) = %llu\n", a, prime_a, reverse_a, reverse_of_prime_a);
+        a++;
     }
 
-    fclose(out);
-    fprintf(stderr, "\nTotal hits: %llu, non-trivial: %llu. Results in hits.txt. Total time: %lds\n",
-            (unsigned long long)hits, (unsigned long long)nontrivial_hits, (long)(time(NULL) - t0));
-}
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    printf("Finished iterating through primes up to %llu\n", LARGEST_PRIME_POSSIBLE);
+    printf("Iterated over %llu primes\n", a - 1);
+    time_taken = time_taken_between(start, end);
+    printf("Time taken to check primes: %.9f seconds\n", time_taken);
+    printf("This means %.9f primes per second\n", (a - 1) / time_taken);
+    printf("Total candidates found: %zu\n", num_candidates);
+    printf("This means %.9f primes per candidate, or that %.9f%% of the primes are candidates\n", (double)(a - 1) / (double)num_candidates, (double)num_candidates / (double)(a - 1) * 100.0);
+    printf("We had to compute bounds for %zu candidates, leaving with %zu candidates that passed the bounds filter, removing %.9f%% of candidates tested\n", had_to_compute_bounds, had_to_compute_primality, (double)(had_to_compute_bounds - had_to_compute_primality) / (double)had_to_compute_bounds * 100.0);
+    printf("We had to compute primality for %zu candidates, leaving with %zu candidates that passed the primality filter, removing %.9f%% of candidates tested\n", had_to_compute_primality, num_candidates, (double)(had_to_compute_primality - num_candidates) / (double)had_to_compute_primality * 100.0);
+    
+    // Now sort the candidates by their reverse value
+    // I'll implement a simple merge sort for this, which I did above
+    
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    merge_sort(candidates, 0, num_candidates - 1);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    time_taken = time_taken_between(start, end);
+    printf("Time taken to sort candidates: %.9f seconds\n", time_taken);
 
-/* ---------------- main ---------------- */
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
-int main(int argc, char **argv) {
-    if (argc > 1) A_MAX = strtoull(argv[1], NULL, 10);
+    // Now compute the reverse prime value for each candidate
+    // For this we use a new iterator
+    primesieve_iterator it2;
+    primesieve_init(&it2);
+    primesieve_jump_to(&it2, 2, LARGEST_PRIME_POSSIBLE);
+    // We will now iterate through the candidates and compute their reverse prime value
+    uint64_t current_prime;
+    a = 1; // We start with the first prime, which is 2, and we already have it in current_prime
+    uint64_t candidate_index = 0; // Index for candidates array
+    while ((current_prime = primesieve_next_prime(&it2)) <= LARGEST_PRIME_POSSIBLE) {
+        // When a matches the reverse_a of candidate, we check if current_prime matches the reverse_prime_a of candidate
+        if (candidate_index >= num_candidates) {
+            break; // No more candidates to check
+        }
+        if (candidates[candidate_index].reverse_a == a) {
+            if (candidates[candidate_index].reverse_prime_a == current_prime) {
+                printf("Found a(%llu) = %llu, reverse(a(%llu)) = %llu, prime(reverse(a(%llu))) = %llu\n", candidates[candidate_index].a, candidates[candidate_index].prime_a, candidates[candidate_index].a, candidates[candidate_index].reverse_a, candidates[candidate_index].a, candidates[candidate_index].reverse_prime_a);
+            }
+            candidate_index++;
+        }
+        a++;
+    }
 
-    uint64_t p_est = nth_prime_upper_bound(A_MAX);
-    int D = digits_u64(p_est);
-    uint64_t sieve_limit = pow10_u64(D) - 1;
+    free(candidates);
 
-    double est_primes = sieve_limit / (log((double)sieve_limit) - 1.0);
-    double est_disk_gb = est_primes * 1.02 / 1e9;
-
-    fprintf(stderr, "A_MAX = %llu\n", (unsigned long long)A_MAX);
-    fprintf(stderr, "Estimated p(A_MAX) ~ %llu (%d digits)\n", (unsigned long long)p_est, D);
-    fprintf(stderr, "Sieve limit (10^%d - 1) = %llu\n", D, (unsigned long long)sieve_limit);
-    fprintf(stderr, "Estimated prime count ~ %.0f, estimated disk usage ~ %.1f GB\n",
-            est_primes, est_disk_gb);
-    fprintf(stderr, "Checkpoint RAM usage ~ %.1f MB\n",
-            (est_primes / CHECKPOINT_INTERVAL) * sizeof(Checkpoint) / 1e6);
-#ifdef _OPENMP
-    fprintf(stderr, "OpenMP enabled, using up to %d threads\n", omp_get_max_threads());
-#else
-    fprintf(stderr, "OpenMP NOT enabled (compile with -fopenmp for parallel search)\n");
-#endif
-    fprintf(stderr, "\n");
-
-    generate_primes(sieve_limit);
-    search();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    time_taken = time_taken_between(start, end);
+    printf("Time taken to compute reverse prime values: %.9f seconds\n", time_taken);
 
     return 0;
 }
