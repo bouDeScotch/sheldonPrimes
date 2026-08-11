@@ -1,9 +1,8 @@
-a=1 n=2 b=1 rev(n)=2 trivial=1
-a=2 n=3 b=2 rev(n)=3 trivial=1
-a=3 n=5 b=3 rev(n)=5 trivial=1
-a=4 n=7 b=4 rev(n)=7 trivial=1
-a=5 n=11 b=5 rev(n)=11 trivial=1
-a=12 n=37 b=21 rev(n)=73 trivial=0
-a=21 n=73 b=12 rev(n)=37 trivial=0
-a=8114118 n=143787341 b=8114118 rev(n)=143787341 trivial=1
-a=535252535 n=11853735811 b=535252535 rev(n)=11853735811 trivial=1
+------Search run A_MAX = 10^11------
+Found a = 4, pi(a) = 7, reverse(a) = 4, pi(reverse(a)) = 7
+Found a = 5, pi(a) = 11, reverse(a) = 5, pi(reverse(a)) = 11
+Found a = 21, pi(a) = 73, reverse(a) = 12, pi(reverse(a)) = 37
+Found a = 12, pi(a) = 37, reverse(a) = 21, pi(reverse(a)) = 73
+Found a = 8114118, pi(a) = 143787341, reverse(a) = 8114118, pi(reverse(a)) = 143787341
+Found a = 535252535, pi(a) = 11853735811, reverse(a) = 535252535, pi(reverse(a)) = 11853735811
+
