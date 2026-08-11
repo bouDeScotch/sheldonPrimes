@@ -2,7 +2,8 @@
 
 High-performance C implementation for finding terms in [OEIS A069469](https://oeis.org/A069469): numbers $k$ such that $\pi(\text{reverse}(k)) = \text{reverse}(\pi(k))$.
 
-These numbers are related to the famous "Sheldon Conjecture" (named after Sheldon Cooper's character from *The Big Bang Theory*, who highlighted the unique properties of $73 = \text{prime}(21)$ ).
+These numbers are related to the famous "Sheldon Conjecture" (named after Sheldon Cooper's character from *The Big Bang Theory*, who highlighted the unique properties of $73 = \text{prime}(21)$
+).
 
 ## 🚀 Key Result & Breakthrough
 
@@ -48,4 +49,4 @@ gcc -Wall -Wextra -O3 prime_reverse.c -o output/prime_reverse.exe -lprimesieve
 ```
 
 ## 🤖 AI Acknowledgment
-The optimization pipeline, analytical bounds derivation, and C implementation were developed collaboratively with AI. Every filter, math bound, and algorithm stage was thoroughly tested, verified, and benchmarked against all known OEIS terms ($a(1)$ through $a(9)$).
+The optimization pipeline, analytical bounds derivation, and C implementation were developed collaboratively with AI. Every filter, math bound, and algorithm stage was thoroughly tested, verified, and benchmarked against all known OEIS terms ( $a(1)$ through $a(9)$ ).
