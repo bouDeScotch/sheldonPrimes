@@ -151,7 +151,7 @@ void merge_sort(Candidate* arr, size_t left, size_t right) {
 
 
 int main() {
-    const int k = 12; // A_MAX is 10^k
+    const int k = 11; // A_MAX is 10^k
     const uint64_t A_MAX = (uint64_t)pow(10, k);
 
     struct timespec start, end;
@@ -259,6 +259,16 @@ int main() {
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
+    FILE* hits_file = fopen("hits.txt", "w");
+    if (hits_file == NULL) {
+        fprintf(stderr, "Error opening hits.txt for writing\n");
+        free(candidates);
+        return 1;
+    } else {
+        printf("Successfully opened hits.txt for writing\n");
+        fprintf(hits_file, "------Search run A_MAX = 10^%d------\n", k);
+    }
+
     // Now compute the reverse prime value for each candidate
     // For this we use a new iterator
     primesieve_iterator it2;
@@ -275,7 +285,8 @@ int main() {
         }
         if (candidates[candidate_index].reverse_a == a) {
             if (candidates[candidate_index].reverse_prime_a == current_prime) {
-                printf("Found a(%llu) = %llu, reverse(a(%llu)) = %llu, prime(reverse(a(%llu))) = %llu\n", candidates[candidate_index].a, candidates[candidate_index].prime_a, candidates[candidate_index].a, candidates[candidate_index].reverse_a, candidates[candidate_index].a, candidates[candidate_index].reverse_prime_a);
+                fprintf(hits_file, "Found a = %llu, pi(a) = %llu, reverse(a) = %llu, pi(reverse(a)) = %llu\n", candidates[candidate_index].a, candidates[candidate_index].prime_a, candidates[candidate_index].reverse_a, current_prime);
+                printf("Found a = %llu, pi(a) = %llu, reverse(a) = %llu, pi(reverse(a)) = %llu\n", candidates[candidate_index].a, candidates[candidate_index].prime_a, candidates[candidate_index].reverse_a, current_prime);   
             }
             candidate_index++;
         }
@@ -283,7 +294,7 @@ int main() {
     }
 
     free(candidates);
-
+    fclose(hits_file);
     clock_gettime(CLOCK_MONOTONIC, &end);
     time_taken = time_taken_between(start, end);
     printf("Time taken to compute reverse prime values: %.9f seconds\n", time_taken);
