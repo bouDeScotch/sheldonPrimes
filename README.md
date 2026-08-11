@@ -13,7 +13,7 @@ By applying tight asymptotic prime bounds and in-memory filtering, this reposito
 
 ## 💡 Algorithmic Improvements (v4 vs Older Versions)
 
-Earlier brute-force approaches generated massive **35 GB disk sieves** and were heavily bottlenecked by SSD I/O. The current architecture (`prime_reverse_v4.c`) introduces a multi-stage filtering pipeline that operates entirely in RAM:
+Earlier brute-force approaches generated massive **35 GB disk sieves** and were heavily bottlenecked by SSD I/O. The current architecture (`prime_reverse.c`) introduces a multi-stage filtering pipeline that operates entirely in RAM:
 
 1. **Lazy Digit Filter ($O(1)$):** Instantly eliminates indices ending in `0` and candidates whose reversed prime is divisible by 2, 3, or 5 before heavy calculations.
 2. **Axler (2017) Asymptotic Bounds:** Uses ultra-tight prime bounds based on $p_n$ expansions ($\ln n + \ln \ln n - 1 + \dots$) to reject **>99.99%** of non-candidate primes instantly without executing expensive primality tests.
